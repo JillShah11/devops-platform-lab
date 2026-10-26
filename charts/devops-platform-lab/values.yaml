@@ -1,0 +1,8 @@
+replicaCount: 3
+
+image:
+  repository: devops-platform-lab
+  tag: v3
+
+service:
+  port: 80
