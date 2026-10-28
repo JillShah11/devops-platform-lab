@@ -1,120 +1,141 @@
-# ================================================================
-# NAME: shown in the GitHub "Actions" tab
-# ================================================================
 name: ci
 
-# ================================================================
-# WHEN to run (the trigger)
-#   - every push to the main branch
-#   - every pull request that targets main
-# ================================================================
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
-# ================================================================
-# DEFAULT PERMISSIONS for the automatic GITHUB_TOKEN:
-# read-only. A job must ask for more if it needs it (least privilege).
-# ================================================================
 permissions:
   contents: read
 
-# ================================================================
-# VARIABLES available to all jobs.
-# github.repository = "your-username/devops-platform-lab"
-# so IMAGE_NAME = ghcr.io/your-username/devops-platform-lab
-# ================================================================
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
-
-# ================================================================
-# JOBS: each job runs on its OWN fresh Ubuntu machine.
-# Jobs 1 and 2 run at the same time. Job 3 waits for both.
-# ================================================================
 jobs:
-
-  # ---------------- JOB 1: look for leaked passwords/keys ----------------
+  # 1. Look for leaked secrets in the code and full Git history
   secret-scan:
-    runs-on: ubuntu-latest              # a fresh Ubuntu VM from GitHub
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4       # download your repo's code onto the VM
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0                # include FULL Git history (old commits too)
-
+          fetch-depth: 0
       - name: Gitleaks
-        # run the Gitleaks scanner as a container against the repo
         run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 git /repo -v
 
-  # ---------------- JOB 2: check code quality ----------------
+  # 2. Lint, unit tests, Helm chart lint
   lint-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4       # download the code
-
-      - uses: actions/setup-python@v5   # install Python 3.12 on the VM
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip                    # remember downloaded packages for next time
+          cache: pip
           cache-dependency-path: app/requirements*.txt
-
-      - name: Install dependencies      # same as on your laptop
+      - name: Install dependencies
         run: pip install -r app/requirements.txt -r app/requirements-dev.txt
-
-      - name: Lint (ruff)               # style and error check
+      - name: Lint (ruff)
         run: ruff check .
-
-      - name: Unit tests (pytest)       # your 2 tests
+      - name: Unit tests (pytest)
         run: python -m pytest -v
-
-      - uses: azure/setup-helm@v4       # install Helm on the VM
-
-      - name: Lint Helm chart           # check the chart is valid
+      - uses: azure/setup-helm@v4
+      - name: Lint Helm chart
         run: helm lint charts/devops-platform-lab
 
-  # ---------------- JOB 3: build the Docker image and publish it ----------------
-  build-push:
-    needs: [secret-scan, lint-test]     # ONLY run if jobs 1 AND 2 passed
+  # 3. Build → scan → SBOM → push → sign
+  build-scan-sign:
+    needs: [secret-scan, lint-test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write                   # this job may push images to GHCR
+      packages: write     # push the image (and its signature) to GHCR
+      id-token: write     # request a GitHub OIDC token for keyless cosign signing
     steps:
       - uses: actions/checkout@v4
 
-      - name: Image tags and labels     # work out the image name + tag
+      - name: Image tags and labels
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository }}
           tags: |
-            type=sha,prefix=sha-,format=short   # tag = sha-<short commit id>, e.g. sha-a1b2c3d
+            type=sha,prefix=sha-,format=short
 
-      - uses: docker/setup-buildx-action@v3     # set up Docker's modern builder
+      # Registry names must be lowercase (your username has capitals)
+      - name: Set lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
-      - name: Log in to GHCR            # log in to GitHub's image registry
-        if: github.event_name == 'push' # only on push (not on pull requests)
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally so we can scan it before pushing)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy report (HIGH + CRITICAL, for visibility)
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:0.58.1 image --no-progress --severity HIGH,CRITICAL
+          ${{ steps.meta.outputs.tags }}
+
+      - name: Trivy gate (fail on fixable CRITICAL)
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          aquasec/trivy:0.58.1 image --no-progress --severity CRITICAL
+          --ignore-unfixed --exit-code 1 ${{ steps.meta.outputs.tags }}
+
+      - name: Generate SBOM (Syft, SPDX JSON)
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock
+          anchore/syft:v1.18.1 ${{ steps.meta.outputs.tags }} -o spdx-json > sbom.spdx.json
+
+      - name: Upload SBOM as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}          # your GitHub username
-          password: ${{ secrets.GITHUB_TOKEN }}  # automatic short-lived token, no real password
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push            # docker build (+ push on main)
-        id: build
+      - name: Push image
+        if: github.event_name == 'push'
+        id: push
         uses: docker/build-push-action@v6
         with:
-          context: .                    # build using the Dockerfile in the repo root
-          push: ${{ github.event_name == 'push' }}   # push on main; build-only on PRs
+          context: .
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha          # reuse layers from earlier runs (faster)
-          cache-to: type=gha,mode=max
+          cache-from: type=gha
 
-      - name: Summary                   # write the tag and digest on the run's page
+      - name: Install cosign
+        if: github.event_name == 'push'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless, GitHub OIDC)
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attest SBOM to the image
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${IMAGE}@${DIGEST}"
+
+      - name: Summary
         if: github.event_name == 'push'
         run: |
-          echo "### Image published" >> "$GITHUB_STEP_SUMMARY"
-          echo "Tags: ${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Digest: ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Image published, scanned and signed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tag: ${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: ${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
