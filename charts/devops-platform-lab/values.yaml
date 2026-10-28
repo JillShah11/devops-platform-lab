@@ -1,8 +1,8 @@
 replicaCount: 3
 
 image:
-  repository: devops-platform-lab
-  tag: v3
+  repository: ghcr.io/jillshah11/devops-platform-lab
+  tag: sha-5119c21
 
 service:
   port: 80
